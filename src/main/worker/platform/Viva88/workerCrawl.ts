@@ -25,7 +25,11 @@ import {
   EvoGeoRestrictedError,
   getEvoSession
 } from '@/worker/platform/Viva88/actions/getEvoSession'
-import { getSabaSession } from '@/worker/platform/Viva88/actions/getSabaSession'
+import {
+  getSabaSession,
+  SabaSession,
+  signSabaName
+} from '@/worker/platform/Viva88/actions/getSabaSession'
 
 /**
  * SABA mini-game Socket.IO worker (Big Small / Se Die).
@@ -225,6 +229,8 @@ let targetBetCount: number | null = null
 // Set while the post-bet switch check runs, and kept once betting must stop for good.
 let switchCheckRunning = false
 let betStopped = false
+// Set once the lobby nickname was registered; a second `unauthorized` stops the worker.
+let nicknameAttempted = false
 
 port.on('message', (account: AccountType) => {
   currentAccount = account
@@ -550,6 +556,65 @@ async function checkSwitchAccount(account: AccountType): Promise<void> {
   } finally {
     switchCheckRunning = false
   }
+}
+
+function emitSignin(client: Socket, session: SabaSession): void {
+  const { username, ss, language } = session
+  const signinPayload = {
+    username,
+    language,
+    ss,
+    time: new Date().toISOString(),
+    isAuthenticated: true,
+    options: { compress: true }
+  }
+
+  log('Emitting signin for username:', username)
+  client.emit('signin', signinPayload)
+}
+
+/**
+ * SABA answers signin with `unauthorized` when the account has no lobby nickname.
+ * Registers the loginID as nickname once and signs in again; stops the worker otherwise.
+ */
+async function registerSabaNickname(
+  client: Socket,
+  account: AccountType,
+  session: SabaSession | null,
+  proxyAgent?: HttpsProxyAgent<string>
+): Promise<void> {
+  if (stopping) return
+  if (nicknameAttempted || !session) {
+    await handleSabaUnauthorized(account)
+    return
+  }
+  nicknameAttempted = true
+
+  log('SABA unauthorized: registering lobby nickname', account.loginID)
+  try {
+    const nickname = await signSabaName(session, account.loginID, proxyAgent)
+    log('SABA nickname registered:', nickname)
+    await accountLogToFile(
+      account.platformName,
+      account.loginID,
+      `SABA nickname registered: ${nickname}`,
+      'Program'
+    )
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    log('SABA signName failed:', message)
+    await accountLogToFile(
+      account.platformName,
+      account.loginID,
+      `[ERROR] SABA signName: ${message}`,
+      'Program'
+    )
+    await handleSabaUnauthorized(account)
+    return
+  }
+
+  if (stopping || !client.connected) return
+  emitSignin(client, session)
 }
 
 /** SABA rejects accounts without a lobby nickname; betting cannot continue until one is set. */
@@ -904,6 +969,8 @@ async function initializeSocket(account: AccountType, config: SabaGameConfig): P
   })
 
   socket = client
+  // Session of the latest signin, reused to register the lobby nickname
+  let sabaSession: SabaSession | null = null
 
   client.on('connect', async () => {
     log('Connected. Socket ID:', client.id)
@@ -928,19 +995,9 @@ async function initializeSocket(account: AccountType, config: SabaGameConfig): P
       process.exit(0)
     }
 
-    const { username, ss, language } = session
-    sabaUsername = username
-    const signinPayload = {
-      username,
-      language,
-      ss,
-      time: new Date().toISOString(),
-      isAuthenticated: true,
-      options: { compress: true }
-    }
-
-    log('Emitting signin for username:', username)
-    client.emit('signin', signinPayload)
+    sabaSession = session
+    sabaUsername = session.username
+    emitSignin(client, session)
   })
 
   client.onAny((eventName: string, ...args: unknown[]) => {
@@ -965,7 +1022,7 @@ async function initializeSocket(account: AccountType, config: SabaGameConfig): P
     }
 
     if (eventName === 'message' && (args[0] as { unauthorized?: boolean })?.unauthorized) {
-      void handleSabaUnauthorized(account)
+      void registerSabaNickname(client, account, sabaSession, proxyAgent)
       return
     }
 
